@@ -14,6 +14,7 @@ mod window;
 mod window_builder;
 mod window_handle;
 
+pub use cef_impl::client::keyboard::set_focused_key_hook;
 pub use runtime::*;
 pub use webview::*;
 pub use window::CefWindowDispatcher;
