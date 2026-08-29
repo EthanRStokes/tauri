@@ -451,6 +451,17 @@ fn is_cef_helper_process() -> bool {
 
 pub(crate) struct AppState<T: UserEvent> {
   pub(crate) windows: HashMap<WindowId, AppWindow>,
+  /// Windows that have been asked to close and whose children have all had
+  /// `close_browser()` called, but are kept alive rather than dropped
+  /// immediately -- Wayland-only. A `wl_subsurface`'s own protocol objects
+  /// (the embedded browser's GPU buffers, explicit-sync timelines) aren't
+  /// safe to leave dangling if the parent `wl_surface` is destroyed while
+  /// they're still asynchronously closing: CEF's own shutdown-time buffer
+  /// cleanup then crashes deep inside libwayland trying to use them. Entries
+  /// here are dropped (destroying the native window) only once every child
+  /// has confirmed closed through `BrowserClosed`. Unused on other
+  /// platforms, which tolerate destroying the parent window immediately.
+  pub(crate) closing_windows: HashMap<WindowId, AppWindow>,
   pub(crate) winid_id_to_window_id_map: HashMap<WinitWindowId, WindowId>,
   pub(crate) callback: Box<dyn FnMut(RunEvent<T>)>,
   pub(crate) live_browsers: usize,
@@ -476,6 +487,7 @@ impl<T: UserEvent> WinitCefApp<T> {
       receiver,
       state: AppState {
         windows: HashMap::new(),
+        closing_windows: HashMap::new(),
         winid_id_to_window_id_map: HashMap::new(),
         callback,
         live_browsers: 0,
@@ -527,22 +539,48 @@ impl<T: UserEvent> WinitCefApp<T> {
         // window rather than trusting the message's window_id — otherwise a
         // reparented webview's scheme-handler entries would leak and its
         // AppWebview would linger in the target window forever.
-        let closed = self.state.windows.iter_mut().find_map(|(id, appwindow)| {
-          appwindow
-            .children
-            .iter()
-            .position(|child| child.webview_id == webview_id)
-            .map(|index| {
-              let child = appwindow.children.remove(index);
-              (*id, child, appwindow.children.is_empty())
+        //
+        // Checked in `windows` first, then `closing_windows` (Wayland only —
+        // see its doc comment): a window mid-close moved there still owns
+        // children whose own closure this message is confirming.
+        fn find_in<'a>(
+          map: impl Iterator<Item = (&'a WindowId, &'a mut AppWindow)>,
+          webview_id: u32,
+        ) -> Option<(WindowId, AppWebview, bool)> {
+          map
+            .into_iter()
+            .find_map(|(id, appwindow)| {
+              appwindow
+                .children
+                .iter()
+                .position(|child| child.webview_id == webview_id)
+                .map(|index| {
+                  let child = appwindow.children.remove(index);
+                  (*id, child, appwindow.children.is_empty())
+                })
             })
-        });
+        }
+
+        let (closed, is_closing) =
+          match find_in(self.state.windows.iter_mut(), webview_id) {
+            Some(found) => (Some(found), false),
+            None => (
+              find_in(self.state.closing_windows.iter_mut(), webview_id),
+              true,
+            ),
+          };
 
         let mut emptied_window = None;
         if let Some((window_id, child, was_last)) = closed {
           self.remove_scheme_handler_entries(&child);
           if was_last {
-            emptied_window = Some(window_id);
+            if is_closing {
+              // Every child of this closing window has now confirmed closed;
+              // safe to drop the native window (and its wl_surface) at last.
+              self.state.closing_windows.remove(&window_id);
+            } else {
+              emptied_window = Some(window_id);
+            }
           }
         }
 
@@ -795,12 +833,19 @@ impl<T: UserEvent> WinitCefApp<T> {
       .state
       .winid_id_to_window_id_map
       .remove(&appwindow.window.id());
-    // The window is gone from state, so BrowserClosed will not find these
-    // children later. Clean registry entries while we still hold them; the CEF
-    // shutdown drain is still enforced by live_browsers.
+    // The window is gone from `windows`, so BrowserClosed looks it up in
+    // `closing_windows` (Wayland) instead, or not at all (elsewhere, where
+    // `appwindow` is simply dropped below). Clean registry entries while we
+    // still hold them; the CEF shutdown drain is still enforced by
+    // live_browsers either way.
     for child in &appwindow.children {
       self.remove_scheme_handler_entries(child);
       child.host.close_browser(1);
+    }
+    if is_wayland() && !appwindow.children.is_empty() {
+      // See `closing_windows`'s doc comment: keep the native window (and its
+      // wl_surface) alive until every child confirms closed.
+      self.state.closing_windows.insert(window_id, appwindow);
     }
     self.exit_if_done(event_loop);
   }
@@ -866,7 +911,18 @@ impl<T: UserEvent> WinitCefApp<T> {
         child.host.close_browser(1);
       }
     }
-    self.state.windows.clear();
+    if is_wayland() {
+      // See `closing_windows`'s doc comment: keep native windows (their
+      // wl_surfaces) alive until every child confirms closed, rather than
+      // dropping them all here.
+      for (id, appwindow) in self.state.windows.drain() {
+        if !appwindow.children.is_empty() {
+          self.state.closing_windows.insert(id, appwindow);
+        }
+      }
+    } else {
+      self.state.windows.clear();
+    }
     self.state.winid_id_to_window_id_map.clear();
   }
 
@@ -1374,6 +1430,20 @@ static IS_WAYLAND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 ))]
 pub(crate) fn is_wayland() -> bool {
   *IS_WAYLAND.get().unwrap_or(&false)
+}
+
+/// Non-Linux platforms have no Wayland concept at all; callers in
+/// cross-platform code can use this unconditionally instead of cfg-gating
+/// every call site.
+#[cfg(not(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+)))]
+pub(crate) fn is_wayland() -> bool {
+  false
 }
 
 impl<T: UserEvent> CefRuntime<T> {
